@@ -6,6 +6,12 @@
 - 推进（advance）：提交非负整数 time_ms，游标只能不减；返回源版本、
   游标，以及该时刻处于活动区间 [start_ms, end_ms)（左闭右开）的字幕
   及其轨道。
+- 事件推进（advance_events）：同样提交非负整数 time_ms 推进游标，
+  额外返回“旧游标 < 事件时刻 <= time_ms”窗口内的全部进入（enter）/
+  退出（exit）事件——一次推进跨过整条短字幕也不会漏掉。事件按时刻
+  升序，同刻先退出后进入，同类按会话字幕顺序。0 毫秒已活动的字幕由
+  创建响应的快照确定，不产生进入事件。事件只随本次推进生成，不保存
+  历史、不提供重放。
 - 接纳（accept）：把场景当前快照并入会话。轨道数不得变；游标前已开始
   （start_ms <= 游标）的字幕，其 id、speaker、起止时间、locked_track
   必须不变，并固定原分轨；其余字幕可改、可删、可新增，但都必须在游标
@@ -147,6 +153,58 @@ class PlaybackManager:
                 "scene_id": session.scene_id,
                 "source_revision": session.source_revision,
                 "cursor_ms": session.cursor_ms,
+                "active": session.active(),
+            }
+
+    def advance_events(
+        self, session: PlaybackSession, time_ms: int
+    ) -> Dict[str, Any]:
+        """推进游标并返回本次跨过的全部进入/退出事件。
+
+        事件窗口为（旧游标, time_ms]：旧游标 < 事件时刻 <= time_ms。
+        字幕在 start_ms 进入、end_ms 退出（区间左闭右开）；因此一次
+        采样间隔内开始又结束的短字幕会同时给出退出与进入事件，不会漏。
+        0 毫秒已活动（start_ms == 0）的字幕由创建会话时的快照确定，
+        初始游标即 0，不产生进入事件。事件按时刻升序；同刻先退出后
+        进入；同类按会话字幕顺序。time_ms 等于当前游标时事件为空。
+
+        事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
+        内一次完成，与推进、接纳完整串行。倒退抛 CursorRegression，
+        会话保持不变。事件不保存历史、不提供重放。
+        """
+        with session.lock:
+            if time_ms < session.cursor_ms:
+                raise CursorRegression(session.cursor_ms, time_ms)
+            old_cursor = session.cursor_ms
+            # 每项为 (时刻, 同刻次序, 会话顺序, 事件体)；同刻次序令 exit 在前
+            pending: List[Tuple[int, int, int, Dict[str, Any]]] = []
+            for order, (sub, track) in enumerate(
+                zip(session.subtitles, session.tracks)
+            ):
+                start_ms = sub["start_ms"]
+                end_ms = sub["end_ms"]
+                base = {
+                    "id": sub["id"],
+                    "speaker": sub["speaker"],
+                    "track": track,
+                }
+                if old_cursor < start_ms <= time_ms:
+                    pending.append(
+                        (start_ms, 1, order, {**base, "time_ms": start_ms, "type": "enter"})
+                    )
+                if old_cursor < end_ms <= time_ms:
+                    pending.append(
+                        (end_ms, 0, order, {**base, "time_ms": end_ms, "type": "exit"})
+                    )
+            pending.sort(key=lambda item: (item[0], item[1], item[2]))
+            events = [item[3] for item in pending]
+            session.cursor_ms = time_ms
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "cursor_ms": session.cursor_ms,
+                "events": events,
                 "active": session.active(),
             }
 

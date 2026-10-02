@@ -167,6 +167,300 @@ def test_advance_unknown_session_404():
 
 
 # ---------------------------------------------------------------------------
+# 事件推进 /sessions/{id}/events
+# ---------------------------------------------------------------------------
+
+
+def _event_triples(body):
+    return [(e["time_ms"], e["type"], e["id"]) for e in body["events"]]
+
+
+def test_events_full_sweep_returns_enter_and_exit_for_every_subtitle():
+    """一次跨过整条字幕：开始与结束都落在窗口内，进入/退出都不漏。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+
+    resp = client.post(f"/sessions/{sid}/events", json={"time_ms": 3000})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cursor_ms"] == 3000
+    assert body["source_revision"] == 1
+    # s1 在 0 毫秒已活动（由创建响应快照确定），不产生 0 时刻进入事件
+    assert _event_triples(body) == [
+        (800, "enter", "s2"),
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+        (2500, "exit", "s3"),
+        (3000, "exit", "s2"),
+    ]
+    # 3000 时全部已结束（右开）
+    assert body["active"] == []
+
+
+def test_events_short_subtitle_fully_between_samples_not_lost():
+    """短字幕在两次采样之间开始又结束：一次推进成对返回进入与退出。"""
+    client = TestClient(app)
+    client.put("/scenes/short", json={
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": [
+            {"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 1000},
+            {"id": "b", "speaker": "B", "start_ms": 500, "end_ms": 600},
+        ],
+    })
+    sid = client.post("/sessions", json={"scene_id": "short"}).json()["session_id"]
+
+    # 400：a 在 0 毫秒已活动（创建快照确定），窗口内无事件
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 400}).json()
+    assert _event_triples(body) == []
+
+    # 直接跳到 1000：b 在两次采样之间已完整播过，进入与退出都要给出；
+    # a 在 0 已活动，只给出 1000 的退出
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert _event_triples(body) == [
+        (500, "enter", "b"),
+        (600, "exit", "b"),
+        (1000, "exit", "a"),
+    ]
+    assert [(x["id"], x["track"]) for x in body["active"]] == []
+
+
+def test_events_carry_id_speaker_track_time_and_type():
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 800}).json()
+    # s1 在 0 毫秒已活动（创建快照确定），窗口内只有 s2 的进入
+    assert body["events"] == [
+        {"id": "s2", "speaker": "Bob", "track": 2, "time_ms": 800, "type": "enter"},
+    ]
+    # 推进后的活动字幕一并返回（含 0 时刻已活动的 s1）
+    assert [(x["id"], x["track"]) for x in body["active"]] == [
+        ("s1", 1),
+        ("s2", 2),
+    ]
+
+
+def test_events_same_instant_exit_before_enter_then_session_order():
+    """同刻先退出后进入；同为进入（或退出）按会话字幕顺序。"""
+    client = TestClient(app)
+    # a[0,100) 与 c[0,100) 同 speaker 不同人？这里只验排序：
+    # 100 时刻 a、c 退出，b、d 进入；同类型按会话顺序 a 在 c 前，b 在 d 前
+    client.put("/scenes/tie", json={
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": [
+            {"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 100},
+            {"id": "b", "speaker": "A", "start_ms": 100, "end_ms": 200},
+            {"id": "c", "speaker": "C", "start_ms": 0, "end_ms": 100},
+            {"id": "d", "speaker": "D", "start_ms": 100, "end_ms": 200},
+        ],
+    })
+    sid = client.post("/sessions", json={"scene_id": "tie"}).json()["session_id"]
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 100}).json()
+    # a、c 在 0 毫秒已活动（创建快照确定），无 0 时刻进入事件
+    assert _event_triples(body) == [
+        (100, "exit", "a"),
+        (100, "exit", "c"),
+        (100, "enter", "b"),
+        (100, "enter", "d"),
+    ]
+
+
+def test_events_window_excludes_old_cursor_and_includes_new_cursor():
+    """窗口为（旧游标, time_ms]：旧游标时刻的事件不再给，新游标时刻给。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+
+    # 先到 1000：窗口 (0,1000] 给出 s2 的进入、1000 的 s1 退出与 s3 进入；
+    # s1 在 0 毫秒已活动（创建快照确定），不产生进入事件
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert _event_triples(body) == [
+        (800, "enter", "s2"),
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+    ]
+
+    # 再到 2500：旧游标 1000 上的事件不得重复，2500 的退出要给出
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 2500}).json()
+    assert _event_triples(body) == [(2500, "exit", "s3")]
+    assert [(x["id"], x["track"]) for x in body["active"]] == [("s2", 2)]
+
+
+def test_events_equal_time_advance_is_empty_but_cursor_moves_once():
+    """等时推进事件为空；游标相等允许，且之后推进不再补发该刻事件。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert len(body["events"]) == 3
+
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert body["events"] == []
+    assert body["cursor_ms"] == 1000
+
+
+def test_events_zero_ms_active_subtitle_from_creation_snapshot():
+    """start_ms=0 的字幕不在事件流里给出进入：由创建响应快照确定。
+
+    0 毫秒已活动字幕以创建响应快照为准（创建时 cursor_ms=0，可由快照
+    自行计算活动集合）；事件窗口为（旧游标, time_ms]，初始游标即 0，
+    因此首次推进（即使 time_ms=0）也不会补发 0 时刻的进入事件。
+    """
+    client = TestClient(app)
+    state = make_session(client)
+    sid = state["session_id"]
+    assert state["cursor_ms"] == 0
+    # 创建快照本身即确定 0 毫秒活动字幕：start_ms=0 <= 0 < end_ms
+    creation_active = [
+        s["id"] for s in state["subtitles"] if s["start_ms"] <= 0 < s["end_ms"]
+    ]
+    assert creation_active == ["s1"]
+
+    # 事件窗口（旧游标=0, time_ms=0] 为空：不补发 0 时刻进入
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 0}).json()
+    assert body["events"] == []
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 800}).json()
+    assert _event_triples(body) == [(800, "enter", "s2")]  # s1 的进入永不出现
+
+
+def test_events_regression_422_and_session_unchanged():
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+    client.post(f"/sessions/{sid}/events", json={"time_ms": 1000})
+
+    resp = client.post(f"/sessions/{sid}/events", json={"time_ms": 999})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["cursor_ms"] == 1000
+
+    # 失败不改会话：游标仍是 1000，窗口 (1000,1000] 为空
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert body["cursor_ms"] == 1000
+    assert body["events"] == []
+    assert [(a["id"], a["track"]) for a in body["active"]] == [("s2", 2), ("s3", 1)]
+
+
+def test_events_negative_time_422():
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+    resp = client.post(f"/sessions/{sid}/events", json={"time_ms": -1})
+    assert resp.status_code == 422
+
+
+def test_events_unknown_session_404():
+    client = TestClient(app)
+    resp = client.post("/sessions/nope/events", json={"time_ms": 0})
+    assert resp.status_code == 404
+
+
+def test_events_advance_and_plain_advance_share_cursor():
+    """事件推进与原推进共用游标；原接口请求/响应保持不变。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+
+    # 原 /advance 先把游标推到 900
+    resp = client.post(f"/sessions/{sid}/advance", json={"time_ms": 900})
+    assert resp.status_code == 200
+    assert "events" not in resp.json()  # 原响应不变
+
+    # 事件推进从旧游标 900 起算，不补发 800 的 s2 进入
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 1000}).json()
+    assert _event_triples(body) == [
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+    ]
+
+    # 事件推进后原推进看到的游标同步前进；倒退仍被拒绝
+    assert client.post(
+        f"/sessions/{sid}/advance", json={"time_ms": 999}
+    ).status_code == 422
+
+
+def test_concurrent_event_advances_serialized():
+    """并发事件推进与原推进/接纳一样在会话锁内完整串行。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+
+    results = []
+    barrier = threading.Barrier(4)
+
+    def worker(time_ms):
+        local = TestClient(app)
+        barrier.wait()
+        resp = local.post(f"/sessions/{sid}/events", json={"time_ms": time_ms})
+        results.append((time_ms, resp.status_code))
+
+    times = [300, 1000, 900, 3000]
+    threads = [threading.Thread(target=worker, args=(t,)) for t in times]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 最大时刻 3000 必定成功；其余成功或 422（倒退），无中间态
+    assert (3000, 200) in results
+    assert all(status in (200, 422) for _, status in results)
+    final = client.post(f"/sessions/{sid}/events", json={"time_ms": 3000}).json()
+    assert final["cursor_ms"] == 3000
+    assert final["events"] == []
+
+
+def test_events_after_accept_use_accepted_snapshot_and_tracks():
+    """接纳后事件来自新快照：新增字幕的进入/退出与新分轨一并生效。"""
+    client = TestClient(app)
+    scene_id = "scene-play"
+    sid = make_session(client, scene_id)["session_id"]
+    # 游标先到 900（s1、s2 已开始）
+    client.post(f"/sessions/{sid}/advance", json={"time_ms": 900})
+
+    # 修订为版本 2：s3 延长到 4000，新增 s4[3200,4000)
+    revise(client, scene_id, 1, [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000},
+        {"id": "s4", "speaker": "Carol", "start_ms": 3200, "end_ms": 4000},
+    ])
+    assert client.post(f"/sessions/{sid}/accept").status_code == 200
+
+    # 事件推进到 4000：窗口 (900,4000]，基于接纳后的快照与分轨
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 4000}).json()
+    assert body["source_revision"] == 2
+    assert _event_triples(body) == [
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+        (3000, "exit", "s2"),
+        (3200, "enter", "s4"),
+        (4000, "exit", "s3"),
+        (4000, "exit", "s4"),
+    ]
+    # 事件携带接纳后重算的轨道
+    by_key = {(e["time_ms"], e["type"], e["id"]): e["track"] for e in body["events"]}
+    assert by_key[(3200, "enter", "s4")] == 2
+    assert by_key[(4000, "exit", "s3")] == 1
+    assert body["active"] == []
+
+
+def test_events_non_integer_or_float_422():
+    """无法转换为非负整数的 time_ms 返回 422（与原 /advance 同一校验模型）。"""
+    client = TestClient(app)
+    sid = make_session(client)["session_id"]
+
+    # 小数无法取整 -> 422；与原 /advance 行为完全一致
+    assert client.post(
+        f"/sessions/{sid}/events", json={"time_ms": 1.5}
+    ).status_code == 422
+    assert client.post(
+        f"/sessions/{sid}/events", json={"time_ms": "abc"}
+    ).status_code == 422
+    assert client.post(
+        f"/sessions/{sid}/advance", json={"time_ms": 1.5}
+    ).status_code == 422
+
+    # 非法请求不改游标：游标仍为 0
+    body = client.post(f"/sessions/{sid}/events", json={"time_ms": 0}).json()
+    assert body["cursor_ms"] == 0
+
+
+# ---------------------------------------------------------------------------
 # 接纳
 # ---------------------------------------------------------------------------
 
