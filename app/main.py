@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from threading import Lock
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -27,7 +27,7 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。"
     ),
-    version="1.2.1",
+    version="1.3.0",
 )
 
 
@@ -174,6 +174,34 @@ class AdvanceResponse(BaseModel):
     scene_id: str
     source_revision: int
     cursor_ms: int
+    active: List[ActiveSubtitleOut]
+
+
+class SubtitleEventOut(BaseModel):
+    """一次推进跨过的字幕事件：进入（start_ms）或退出（end_ms）。"""
+
+    id: Union[str, int]
+    speaker: str
+    track: int = Field(..., description="事件发生时该字幕在会话中的分轨")
+    time_ms: int = Field(..., description="事件时刻（毫秒）：进入为 start_ms，退出为 end_ms")
+    type: Literal["enter", "exit"] = Field(
+        ..., description="enter=进入（左闭），exit=退出（右开）"
+    )
+
+
+class AdvanceEventsResponse(BaseModel):
+    """推进结果：本次跨过的全部事件、推进后的活动字幕、源版本与游标。
+
+    events 仅含 旧游标 < 事件时刻 <= time_ms 的事件，按时刻升序；同一时刻
+    先退出后进入，同类按会话字幕顺序。等时推进 events 为空。0 毫秒已活动
+    的字幕不产生进入事件，由创建会话响应的快照（assignments）确定。
+    """
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    events: List[SubtitleEventOut]
     active: List[ActiveSubtitleOut]
 
 
@@ -396,6 +424,36 @@ def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
             },
         )
     return AdvanceResponse(**state)
+
+
+@app.post("/sessions/{session_id}/events", response_model=AdvanceEventsResponse)
+def session_events(session_id: str, req: AdvanceRequest) -> AdvanceEventsResponse:
+    """推进游标到 time_ms，返回本次推进跨过的全部字幕进入/退出事件。
+
+    与 /advance 使用同样的会话锁与游标规则（非负整数、只能不减），但把
+    事件生成、游标更新与活动字幕计算作为一个完整操作串行生效：事件覆盖
+    旧游标 < 事件时刻 <= time_ms，短字幕即便完全落在两次采样之间，其进入
+    与退出也会一并返回。事件按时刻升序；同一时刻先退出后进入；同类按会话
+    字幕顺序。等时推进（time_ms 等于当前游标）events 为空。0 毫秒已活动
+    的字幕不产生进入事件——由 POST /sessions 创建响应的快照确定。
+
+    事件严格基于轮到本请求生效时的会话快照，不读取未接纳的场景修订。
+    响应另含推进后的活动字幕（active）、源版本与游标；不保存事件历史，
+    也不提供重放。未知会话返回 404；非法时间或倒退返回 422 且会话不变。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().advance_with_events(session, req.time_ms)
+    except CursorRegression as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "time_ms 只能不减，不得小于当前游标",
+                "cursor_ms": exc.cursor_ms,
+                "time_ms": exc.time_ms,
+            },
+        )
+    return AdvanceEventsResponse(**state)
 
 
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)

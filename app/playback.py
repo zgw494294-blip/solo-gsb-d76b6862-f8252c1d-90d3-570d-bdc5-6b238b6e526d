@@ -5,7 +5,10 @@
 
 - 推进（advance）：提交非负整数 time_ms，游标只能不减；返回源版本、
   游标，以及该时刻处于活动区间 [start_ms, end_ms)（左闭右开）的字幕
-  及其轨道。
+  及其轨道。带事件的推进（advance_with_events）额外返回本次推进跨过
+  （旧游标 < 事件时刻 <= 新游标）的全部进入/退出事件，短字幕整条落在
+  两次采样之间也不会漏掉；事件按时刻升序，同刻先退出后进入，同类按
+  会话字幕顺序。
 - 接纳（accept）：把场景当前快照并入会话。轨道数不得变；游标前已开始
   （start_ms <= 游标）的字幕，其 id、speaker、起止时间、locked_track
   必须不变，并固定原分轨；其余字幕可改、可删、可新增，但都必须在游标
@@ -13,11 +16,13 @@
   冲突或无解即失败且会话保持不变；成功则整体替换会话快照与源版本，
   场景本身不受影响。
 
-会话只存在于本进程内存中，不随重启保留。同一会话上的推进与接纳通过
-会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。接纳是一个
-完整操作——场景快照的读取（load_record 回调）、已开始字幕校验、分轨
-重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求读到的一定
-是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的旧版本。
+会话只存在于本进程内存中，不随重启保留。同一会话上的推进（含带事件
+推进）与接纳通过会话级互斥锁串行化：每次调用要么完整生效，要么完全
+无效。带事件推进的事件生成与游标更新在锁内一次完成，事件基于轮到该
+请求生效时的会话快照。接纳是一个完整操作——场景快照的读取
+（load_record 回调）、已开始字幕校验、分轨重算与会话替换都在会话锁内
+完成，因此并发下迟到的接纳请求读到的一定是轮到它生效时的场景快照，
+不会把会话回写到进入锁之前读到的旧版本。
 """
 from __future__ import annotations
 
@@ -77,6 +82,38 @@ class PlaybackSession:
             {**sub, "track": track}
             for sub, track in zip(self.subtitles, self.tracks)
             if sub["start_ms"] <= self.cursor_ms < sub["end_ms"]
+        ]
+
+    def crossed_events(self, old_cursor: int, new_cursor: int) -> List[Dict[str, Any]]:
+        """推进 (old_cursor, new_cursor] 跨过的全部进入/退出事件。
+
+        进入时刻为 start_ms、退出时刻为 end_ms（区间左闭右开）；仅返回
+        old_cursor < 事件时刻 <= new_cursor 的事件，因此：
+
+        - 0 毫秒已活动（start_ms == 0）的字幕不产生进入事件——它们由创建
+          会话时返回的快照确定，客户端据快照自行置为活动；
+        - 等时推进（old_cursor == new_cursor）事件为空；
+        - 完全落在两次采样之间的短字幕，其进入与退出都会一并返回，不会漏掉。
+
+        排序：事件时刻升序；同一时刻先退出后进入；同类事件按会话字幕顺序。
+        """
+        # 排序码：(时刻, 退出=0/进入=1, 会话字幕下标) —— 同刻先退后入
+        events: List[Tuple[int, int, int, str, Dict[str, Any], int]] = []
+        for index, (sub, track) in enumerate(zip(self.subtitles, self.tracks)):
+            if old_cursor < sub["start_ms"] <= new_cursor:
+                events.append((sub["start_ms"], 1, index, "enter", sub, track))
+            if old_cursor < sub["end_ms"] <= new_cursor:
+                events.append((sub["end_ms"], 0, index, "exit", sub, track))
+        events.sort(key=lambda e: (e[0], e[1], e[2]))
+        return [
+            {
+                "id": sub["id"],
+                "speaker": sub["speaker"],
+                "track": track,
+                "time_ms": at_ms,
+                "type": kind,
+            }
+            for at_ms, _order, _index, kind, sub, track in events
         ]
 
     def state(self) -> Dict[str, Any]:
@@ -147,6 +184,32 @@ class PlaybackManager:
                 "scene_id": session.scene_id,
                 "source_revision": session.source_revision,
                 "cursor_ms": session.cursor_ms,
+                "active": session.active(),
+            }
+
+    def advance_with_events(
+        self, session: PlaybackSession, time_ms: int
+    ) -> Dict[str, Any]:
+        """推进游标并返回本次跨过的全部进入/退出事件。
+
+        事件生成、游标更新与活动字幕计算在同一会话锁内作为完整操作，
+        与原推进（advance）及接纳（accept）完整串行：事件严格基于旧游标
+        与新游标之间“轮到本请求生效时”的会话快照，不会读到未接纳的场景
+        修订，也不会与交错的接纳混用两份快照。倒退抛 CursorRegression，
+        会话保持不变（不产生事件、不推进游标）。
+        """
+        with session.lock:
+            old_cursor = session.cursor_ms
+            if time_ms < old_cursor:
+                raise CursorRegression(old_cursor, time_ms)
+            events = session.crossed_events(old_cursor, time_ms)
+            session.cursor_ms = time_ms
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "cursor_ms": session.cursor_ms,
+                "events": events,
                 "active": session.active(),
             }
 

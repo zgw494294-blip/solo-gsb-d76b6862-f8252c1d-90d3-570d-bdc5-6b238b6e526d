@@ -9,6 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。
+- 播放客户端可通过 `POST /sessions/{session_id}/events` 做**带事件的推进**：一次推进返回**旧游标 < 事件时刻 ≤ `time_ms`** 的全部字幕进入/退出事件，跨过整条短字幕（进入与退出都落在两次采样之间）也不会漏掉。事件生成与游标更新、接纳修订在同一会话锁内完整串行。
 
 ## 一条命令启动
 
@@ -285,6 +286,14 @@ HTTP/1.1 409 Conflict
 
 - `POST /sessions`：创建会话。请求体 `{"scene_id": "..."}`；场景不存在返回 404。响应为会话完整状态：`session_id`、`scene_id`、`source_revision`（快照来源的场景版本）、`cursor_ms`（初始 0）、`track_count`、`subtitles`、`assignments`、`changes`。
 - `POST /sessions/{session_id}/advance`：推进游标。请求体 `{"time_ms": N}`，`N` 为非负整数且**只能不减**（等于当前游标允许）；负数、非整数或倒退返回 422 且会话不变。响应含 `source_revision`、`cursor_ms` 与 `active`：游标时刻处于 `[start_ms, end_ms)`（左闭右开）区间的字幕及其轨道。
+- `POST /sessions/{session_id}/events`：**带字幕事件的推进**。请求体与 `/advance` 相同（`{"time_ms": N}`，非负整数、只能不减），同样把游标推进到 `time_ms`，但响应额外含本次推进跨过的全部 `events`：
+  - 事件窗口为 **旧游标 < 事件时刻 ≤ `time_ms`**：进入事件时刻取 `start_ms`，退出事件时刻取 `end_ms`（区间左闭右开）。短字幕即使整条落在两次采样之间，其进入与退出也会在同一次响应中返回，不会漏掉；不保存事件历史，也不提供重放——窗口之前的事件不再返回。
+  - **0 毫秒已活动**（`start_ms == 0`）的字幕不产生进入事件：它们由 `POST /sessions` 创建响应的快照（`assignments`）确定，客户端创建会话时即应置为活动。
+  - 每个事件含字幕 `id`、`speaker`、`track`（事件发生时该字幕在会话中的分轨）、`time_ms`（毫秒时刻）与 `type`（`"enter"` 进入 / `"exit"` 退出）。
+  - 事件按 `time_ms` 升序；**同一时刻先退出后进入**；同类事件按会话字幕顺序排列。**等时推进**（`time_ms` 等于当前游标）`events` 为空。
+  - 响应还含推进后的 `active`（结构与 `/advance` 相同）、`source_revision` 与推进后的 `cursor_ms`。
+  - 事件基于**轮到本请求生效时的会话快照**生成，不读取未接纳的场景修订；事件生成与游标更新是同一个完整操作，与同一会话的 `/advance`、`/accept` 完整串行。未知会话返回 404；非法时间或倒退返回 422，失败不改变会话与场景。
+  - `/advance` 的请求与响应保持不变；两个端点推进的是同一个游标，可混用（事件窗口始终为“上一次任一推进后的游标 → 本次游标”）。
 - `POST /sessions/{session_id}/accept`：接纳场景当前快照。规则：
   - 轨道数不得变；
   - 会话中 `start_ms` ≤ 游标的字幕（已开始，含已播完），其 `id`、`speaker`、起止时间、`locked_track` 必须不变，并**固定原分轨**；
@@ -344,9 +353,108 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 
 `active` 为游标时刻 `[start_ms, end_ms)` 内的字幕及轨道：900 时 s1（0≤900<1000）与 s2（800≤900<3000）在屏，s3（1000 才开始）不在。再次提交更小的 `time_ms` 返回 422。
 
-### 示例 11：播放中接纳场景修订
+### 示例 11：一次推进跨过整条短字幕（进入/退出事件都不漏）
 
-播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
+先准备一个含“闪现”短字幕的场景并创建会话（s4 仅在 `[2500, 2550)` 出现 50 毫秒，端点相接复用 s3 腾出的轨 1）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/events-demo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500},
+      {"id": "s4", "speaker": "Dan",   "start_ms": 2500, "end_ms": 2550}
+    ]
+  }'
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "events-demo"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+```
+
+> 0 毫秒已活动的 s1（`start_ms=0`）**不产生进入事件**：创建会话的响应快照里 s1→轨 1，客户端创建时即应把它置为活动。
+
+粗粒度采样，客户端在 0 与 2600 毫秒各推进一次——s4 的整个生命期都落在两次采样之间（2500 与 s3 的退出同刻，先退后入）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' \
+  -d '{"time_ms": 0}'
+# {"session_id":"…","scene_id":"events-demo","source_revision":1,"cursor_ms":0,
+#  "events":[],
+#  "active":[{"id":"s1","speaker":"Alice","start_ms":0,"end_ms":1000,"locked_track":null,"track":1}]}
+
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' \
+  -d '{"time_ms": 2600}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "events-demo",
+  "source_revision": 1,
+  "cursor_ms": 2600,
+  "events": [
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 800,  "type": "enter"},
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "exit"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "enter"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 2500, "type": "exit"},
+    {"id": "s4", "speaker": "Dan",   "track": 1, "time_ms": 2500, "type": "enter"},
+    {"id": "s4", "speaker": "Dan",   "track": 1, "time_ms": 2550, "type": "exit"}
+  ],
+  "active": [
+    {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000, "locked_track": 2, "track": 2}
+  ]
+}
+```
+
+事件已排好序：800 进入 s2 → **1000 先退出 s1、后进入 s3**（同刻先退后入）→ **2500 先退出 s3、后进入 s4**（端点相接，同刻先退后入）→ 2550 退出 s4。短字幕 s4 虽从未出现在任何一次采样的 `active` 中，进入与退出事件仍完整送达。事件窗口是 `(旧游标, 新游标]`，因此再推进到 2600（等时推进）返回 `"events": []`；倒退到 2599 返回 422 且游标不变。
+
+### 示例 12：端点交接——创建快照置初始活动，/advance 与 /events 共用游标
+
+事件端点与原 `/advance` 推进的是同一个游标，可以混用；事件只覆盖“上一次推进（任一端点）之后”的窗口，因此 0 时刻的活动状态要靠创建响应交接：
+
+```bash
+# 创建会话：用响应快照确定 0 毫秒已活动的字幕（s1 在轨 1），不等待事件
+curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "events-demo"}' \
+  | python3 -c 'import sys,json; s=json.load(sys.stdin); print(s["session_id"]); print(s["assignments"])'
+
+# 用原 /advance 推进到 700（无事件语义，只取活动快照）
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 700}'
+
+# 改用 /events 推进到 900：事件窗口为 (700, 900]
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}'
+```
+
+第二次请求的事件只含窗口内的边界：`800 enter s2`。s1 的进入（0 毫秒）永远不会作为事件下发——它由创建响应的快照确定；继续等时或小步推进也**不重放**窗口之前的事件：
+
+```bash
+# 再推进到 1000：窗口 (900, 1000]，1000 同刻先退后入
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'
+# events: 1000 exit s1, 1000 enter s3
+
+# 等时推进：事件为空
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'
+# {"…","cursor_ms":1000,"events":[],"active":[{"id":"s2",…},{"id":"s3",…}]}
+```
+
+非法时间（负数、非整数）或小于当前游标返回 **422**，会话不变；未知会话（含服务重启后）返回 **404**。服务不保存事件历史，也不提供重放；中途加入的客户端应新建会话并以创建快照为准。
+
+### 示例 13：播放中接纳场景修订
+
+> 本例沿用示例 10 的会话（`scene-001`，游标 900）；如已用示例 11/12 的 `events-demo` 做过实验，请按示例 10 重新创建 `scene-001` 的会话并推进到 900。
+
+播放期间场景被修订（把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`；修订方式同示例 7）。会话接纳最新快照：
 
 ```bash
 curl -s -X POST http://localhost:8080/sessions/$SID/accept
@@ -372,7 +480,35 @@ curl -s -X POST http://localhost:8080/sessions/$SID/accept
 
 游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
 
-### 示例 12：接纳冲突返回 409（会话不变）
+接纳之后再用事件端点推进，事件按**新快照**生成（未接纳的场景修订则完全不可见）。例如接着推进到 3500，s3 在修订后延长到 4000、s4 `[3200,4000)` 已进入，二者都仍在屏：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3500}'
+```
+
+```json
+{
+  "session_id": "9f2c…",
+  "scene_id": "scene-001",
+  "source_revision": 2,
+  "cursor_ms": 3500,
+  "events": [
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "exit"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "enter"},
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 3000, "type": "exit"},
+    {"id": "s4", "speaker": "Carol", "track": 2, "time_ms": 3200, "type": "enter"}
+  ],
+  "active": [
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000, "locked_track": null, "track": 1},
+    {"id": "s4", "speaker": "Carol", "start_ms": 3200, "end_ms": 4000, "locked_track": null, "track": 2}
+  ]
+}
+```
+
+事件窗口是接纳前的旧游标 900：s1 的退出（1000）与 s3 的进入（1000，同刻先退后入）来自已开始字幕的固定区间，s2 的退出（3000）、s4 的进入（3200）只可能来自**已接纳**的修订（s4 是版本 2 新增字幕）。事件生成、游标更新与接纳在同一会话锁内完整串行，并发下不会读到半接纳状态。
+
+### 示例 14：接纳冲突返回 409（会话不变）
 
 若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
 
@@ -401,7 +537,7 @@ HTTP/1.1 409 Conflict
 
 修复后，接纳把“读取场景快照 → 校验已开始字幕 → 重算分轨 → 替换会话状态”作为**完整操作**在会话锁内串行生效：场景读取发生在轮到该请求生效之时，因此迟到的请求接纳的一定是当时的场景快照——既不会把旧数据回写到会话上，也不会跳过旧数据却报告成功。会话的 `source_revision` 对同一会话只增不回退。请求、响应与错误码（200/404/409/422）均与之前兼容。
 
-### 示例 13：并发接纳——迟到请求不会回写旧快照
+### 示例 15：并发接纳——迟到请求不会回写旧快照
 
 ```bash
 # 1) 创建场景（版本 1：未开始的 s3 end_ms=2000）
@@ -496,13 +632,13 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验）
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制）
-  playback.py  # 播放会话：单进程内存态，推进/接纳串行化（接纳含场景读取的完整操作）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/带事件推进/接纳串行化（接纳含场景读取的完整操作）、跨过事件生成与保轨重算
 tests/
   conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试
   test_api.py        # /assign HTTP 层测试
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
-  test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
+  test_playback.py   # 播放会话创建/推进/事件流/接纳/冲突/并发测试
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

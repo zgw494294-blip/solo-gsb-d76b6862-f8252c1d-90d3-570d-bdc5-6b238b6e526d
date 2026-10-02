@@ -167,6 +167,316 @@ def test_advance_unknown_session_404():
 
 
 # ---------------------------------------------------------------------------
+# 推进事件流：POST /sessions/{id}/events
+# ---------------------------------------------------------------------------
+
+
+def events_scene_payload():
+    """s1[0,1000) s2[800,3000)锁2 s3[1000,2500) 短字幕 s4[2500,2550)。
+
+    分轨 1/2/1/1（s4 在 s3 结束后进入，与 s2 不重叠，可复用轨 1）。
+    """
+    return {
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": [
+            {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+            {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+             "locked_track": 2},
+            {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500},
+            {"id": "s4", "speaker": "Dan", "start_ms": 2500, "end_ms": 2550},
+        ],
+    }
+
+
+def make_events_session(client, scene_id="scene-events"):
+    resp = client.put(f"/scenes/{scene_id}", json=events_scene_payload())
+    assert resp.status_code == 200
+    assert resp.json()["assignments"] == [
+        {"id": "s1", "track": 1},
+        {"id": "s2", "track": 2},
+        {"id": "s3", "track": 1},
+        {"id": "s4", "track": 1},
+    ]
+    resp = client.post("/sessions", json={"scene_id": scene_id})
+    assert resp.status_code == 200
+    return resp.json()["session_id"]
+
+
+def post_events(client, sid, time_ms):
+    return client.post(f"/sessions/{sid}/events", json={"time_ms": time_ms})
+
+
+def test_events_zero_ms_active_subtitles_have_no_enter_event():
+    """0 毫秒已活动（start_ms=0）的字幕由创建快照确定，不产生进入事件。"""
+    client = TestClient(app)
+    sid = make_events_session(client)
+
+    resp = post_events(client, sid, 0)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cursor_ms"] == 0
+    assert body["source_revision"] == 1
+    assert body["events"] == []  # 等时推进/初始推进到 0：无事件
+    # 活动字幕来自创建快照的语义：0 时 s1 在屏
+    assert [a["id"] for a in body["active"]] == ["s1"]
+
+
+def test_events_cross_whole_short_subtitle_in_one_advance():
+    """一次大步推进跨过整条短字幕：进入与退出都要返回，不漏事件。"""
+    client = TestClient(app)
+    sid = make_events_session(client)
+
+    body = post_events(client, sid, 2600).json()
+    events = [(e["time_ms"], e["type"], e["id"]) for e in body["events"]]
+    assert events == [
+        (800, "enter", "s2"),
+        (1000, "exit", "s1"),   # 同刻先退出
+        (1000, "enter", "s3"),  # 后进入
+        (2500, "exit", "s3"),
+        (2500, "enter", "s4"),  # 端点相接：s3 退、s4 进同刻，先退后入
+        (2550, "exit", "s4"),   # 短字幕退出（两次采样之间完整跨过）
+    ]
+    # 推进后活动字幕（s4 已退出，仅 s2 在屏）
+    assert [(a["id"], a["track"]) for a in body["active"]] == [("s2", 2)]
+    assert body["cursor_ms"] == 2600
+
+
+def test_events_carry_id_speaker_track_time_and_type():
+    client = TestClient(app)
+    sid = make_events_session(client)
+
+    body = post_events(client, sid, 800).json()
+    assert body["events"] == [
+        {"id": "s2", "speaker": "Bob", "track": 2,
+         "time_ms": 800, "type": "enter"}
+    ]
+
+    # 跨过 s1 退出
+    body = post_events(client, sid, 1000).json()
+    assert body["events"] == [
+        {"id": "s1", "speaker": "Alice", "track": 1,
+         "time_ms": 1000, "type": "exit"},
+        {"id": "s3", "speaker": "Alice", "track": 1,
+         "time_ms": 1000, "type": "enter"},
+    ]
+
+
+def test_events_same_timestamp_exits_before_enters():
+    """同刻事件：先全部退出，后全部进入；同类按会话字幕顺序。"""
+    client = TestClient(app)
+    # 构造同刻两条退出（s1 与 sx 都在 1000 结束）与一条进入
+    client.put("/scenes/scene-sametime", json={
+        "track_count": 2,
+        "expected_revision": 0,
+        "subtitles": [
+            {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+            {"id": "sx", "speaker": "X", "start_ms": 900, "end_ms": 1000,
+             "locked_track": 2},
+            {"id": "s2", "speaker": "Bob", "start_ms": 1000, "end_ms": 2000},
+        ],
+    })
+    sid = client.post("/sessions", json={"scene_id": "scene-sametime"}).json()[
+        "session_id"
+    ]
+
+    body = post_events(client, sid, 1000).json()
+    events = [(e["type"], e["id"]) for e in body["events"]]
+    # 1000：退出按会话顺序 s1、sx，之后进入 s2
+    assert events == [("exit", "s1"), ("exit", "sx"), ("enter", "s2")]
+    assert [a["id"] for a in body["active"]] == ["s2"]
+
+
+def test_events_equal_time_advance_is_empty():
+    client = TestClient(app)
+    sid = make_events_session(client)
+    post_events(client, sid, 2000)
+    resp = post_events(client, sid, 2000)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["events"] == []
+    assert body["cursor_ms"] == 2000
+    assert [(a["id"]) for a in body["active"]] == ["s2", "s3"]
+
+
+def test_events_do_not_reemit_across_separate_advances():
+    """事件窗口为 (旧游标, 新游标]：分段推进不会重复、不会漏掉。"""
+    client = TestClient(app)
+    sid = make_events_session(client)
+
+    first = [(e["time_ms"], e["type"], e["id"])
+             for e in post_events(client, sid, 900).json()["events"]]
+    assert first == [(800, "enter", "s2")]
+
+    second = [(e["time_ms"], e["type"], e["id"])
+              for e in post_events(client, sid, 2550).json()["events"]]
+    assert second == [
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+        (2500, "exit", "s3"),
+        (2500, "enter", "s4"),
+        (2550, "exit", "s4"),
+    ]
+
+    third = [(e["time_ms"], e["type"], e["id"])
+             for e in post_events(client, sid, 4000).json()["events"]]
+    assert third == [(3000, "exit", "s2")]
+
+
+def test_events_regression_422_and_session_unchanged():
+    client = TestClient(app)
+    sid = make_events_session(client)
+    post_events(client, sid, 2000)
+
+    resp = post_events(client, sid, 1999)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["cursor_ms"] == 2000
+    assert resp.json()["detail"]["time_ms"] == 1999
+
+    # 失败不产生事件、不推进游标：用等时推进确认游标仍为 2000
+    body = post_events(client, sid, 2000).json()
+    assert body["cursor_ms"] == 2000
+    assert body["events"] == []
+    assert [a["id"] for a in body["active"]] == ["s2", "s3"]
+
+
+def test_events_negative_time_422():
+    client = TestClient(app)
+    sid = make_events_session(client)
+    assert post_events(client, sid, -1).status_code == 422
+    # 非整数同样 422（Pydantic 校验）
+    resp = client.post(f"/sessions/{sid}/events", json={"time_ms": 1.5})
+    assert resp.status_code == 422
+
+
+def test_events_unknown_session_404():
+    client = TestClient(app)
+    assert post_events(client, "nope", 0).status_code == 404
+
+
+def test_events_use_accepted_snapshot_not_unaccepted_revision():
+    """接纳后事件按新快照生成；未接纳的场景修订不影响事件。"""
+    client = TestClient(app)
+    scene_id = "scene-events-acc"
+    sid = make_events_session(client, scene_id)
+    post_events(client, sid, 900)  # s1、s2 已开始
+
+    # 修订场景为版本 2（s3 延长、新增 s5、删除短字幕 s4），但先不接纳
+    revise(client, scene_id, 1, [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2600},
+        {"id": "s5", "speaker": "Eve", "start_ms": 2700, "end_ms": 2900},
+    ])
+
+    # 未接纳：推进仍用会话快照（s3 end_ms=2500，有 s4、无 s5）
+    body = post_events(client, sid, 3000).json()
+    events = [(e["time_ms"], e["type"], e["id"]) for e in body["events"]]
+    assert events == [
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+        (2500, "exit", "s3"),
+        (2500, "enter", "s4"),
+        (2550, "exit", "s4"),
+        (3000, "exit", "s2"),
+    ]
+    assert body["source_revision"] == 1
+
+    # 接纳后按新快照：s3 在 2600 才退出，s5 的进入/退出可见，s4 不存在
+    assert client.post(f"/sessions/{sid}/accept").status_code == 200
+    body = post_events(client, sid, 3000).json()
+    events = [(e["time_ms"], e["type"], e["id"]) for e in body["events"]]
+    assert events == [
+        (2600, "exit", "s3"),
+        (2700, "enter", "s5"),
+        (2900, "exit", "s5"),
+        (3000, "exit", "s2"),
+    ]
+    assert body["source_revision"] == 2
+    assert body["active"] == []
+
+
+def test_events_serialized_with_accept_under_concurrency(monkeypatch):
+    """事件推进与接纳完整串行：在途接纳在锁内读快照，事件推进不会读到
+    半接纳状态；两者结果均自洽。"""
+    client = TestClient(app)
+    scene_id = "scene-events-race"
+    sid = make_events_session(client, scene_id)
+    post_events(client, sid, 900)  # s1、s2 已开始
+
+    # 接纳读到的快照为版本 2：s3 延长到 2600，删除短字幕 s4，新增 s5
+    extend_s3_to_4000_nos4(client, scene_id)
+
+    # 暂停接纳的“锁内场景读取”，让事件推进先抵达会话锁并排队
+    store = main_module.get_store()
+    real_get_scene = store.get_scene
+    paused = threading.Event()
+    release = threading.Event()
+    entered = []
+
+    def wrapped_get_scene(sid_):
+        if entered:
+            return real_get_scene(sid_)
+        entered.append(sid_)
+        paused.set()
+        assert release.wait(timeout=10)
+        return real_get_scene(sid_)
+
+    monkeypatch.setattr(store, "get_scene", wrapped_get_scene)
+
+    responses = {}
+
+    def post_accept():
+        local = TestClient(app)
+        responses["accept"] = local.post(f"/sessions/{sid}/accept")
+
+    t = threading.Thread(target=post_accept)
+    t.start()
+    assert paused.wait(timeout=10)  # 接纳已持锁并停在锁内读取
+    try:
+        # 事件推进必须等接纳的完整操作结束，不能穿插
+        fired = threading.Event()
+
+        def post_events_locked():
+            local = TestClient(app)
+            r = local.post(f"/sessions/{sid}/events", json={"time_ms": 2500})
+            responses["events"] = r
+            fired.set()
+
+        te = threading.Thread(target=post_events_locked)
+        te.start()
+        assert not fired.wait(timeout=0.5), "事件推进在接纳完整操作结束前生效"
+    finally:
+        release.set()
+    t.join(timeout=10)
+    te.join(timeout=10)
+    assert not t.is_alive() and not te.is_alive()
+
+    assert responses["accept"].status_code == 200
+    ev_body = responses["events"].json()
+    # 接纳先生效：事件基于版本 2 快照——s3 延长到 2600（2500 仍活动），s4 不存在
+    assert ev_body["source_revision"] == 2
+    events = [(e["time_ms"], e["type"], e["id"]) for e in ev_body["events"]]
+    assert events == [
+        (1000, "exit", "s1"),
+        (1000, "enter", "s3"),
+    ]
+    assert [a["id"] for a in ev_body["active"]] == ["s2", "s3"]
+
+
+def extend_s3_to_4000_nos4(client, scene_id):
+    """版本 2：s3 end_ms 2500 -> 2600，删除短字幕 s4，新增 s5[2700,2900)。"""
+    revise(client, scene_id, 1, [
+        {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000},
+        {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000,
+         "locked_track": 2},
+        {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2600},
+        {"id": "s5", "speaker": "Eve", "start_ms": 2700, "end_ms": 2900},
+    ])
+
+
+# ---------------------------------------------------------------------------
 # 接纳
 # ---------------------------------------------------------------------------
 
