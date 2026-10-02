@@ -1,0 +1,432 @@
+"""FastAPI 入口：请求/响应模型与路由。"""
+from __future__ import annotations
+
+from threading import Lock
+from typing import List, Optional, Union
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from . import storage as storage_module
+from .playback import (
+    AcceptConflict,
+    CursorRegression,
+    PlaybackManager,
+    PlaybackSession,
+    SceneUnavailable,
+)
+from .solver import Subtitle, solve, validate
+from .storage import RevisionConflict, SceneRecord, SceneStore
+
+app = FastAPI(
+    title="对白字幕分轨 API",
+    description=(
+        "为离线对白字幕分配屏幕轨道：时间重叠的字幕不同轨，"
+        "同一说话人按时间相邻字幕的换轨次数最少，并列取轨道号序列字典序最小者。"
+        "场景（scene）可按 scene_id 保存修订快照，并以版本号做乐观并发控制。"
+        "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
+        "后续修订：已开始字幕保持原分轨，其余按原规则重算。"
+    ),
+    version="1.2.1",
+)
+
+
+class SubtitleIn(BaseModel):
+    id: Union[str, int] = Field(..., description="全局唯一的字幕 id")
+    speaker: str = Field(..., description="说话人标识，非空")
+    start_ms: int = Field(..., ge=0, description="开始时间（毫秒，非负）")
+    end_ms: int = Field(..., ge=0, description="结束时间（毫秒，必须大于 start_ms）")
+    locked_track: Optional[int] = Field(
+        default=None, ge=1, description="可选：锁定轨道号（从 1 开始）"
+    )
+
+    @field_validator("speaker")
+    @classmethod
+    def _speaker_not_blank(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("speaker 不能为空")
+        return v
+
+    @field_validator("id")
+    @classmethod
+    def _id_not_blank(cls, v: Union[str, int]) -> Union[str, int]:
+        if isinstance(v, str) and v == "":
+            raise ValueError("id 不能为空字符串")
+        return v
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "SubtitleIn":
+        if self.start_ms >= self.end_ms:
+            raise ValueError("start_ms 必须小于 end_ms")
+        return self
+
+
+class AssignRequest(BaseModel):
+    track_count: int = Field(
+        ..., ge=2, le=3, description="屏幕轨道数（2～3，轨道号从 1 开始）"
+    )
+    subtitles: List[SubtitleIn] = Field(
+        ..., min_length=1, max_length=12, description="字幕列表（1～12 条，按输入顺序）"
+    )
+
+    @model_validator(mode="after")
+    def _check_cross_item_rules(self) -> "AssignRequest":
+        subs = [
+            Subtitle(
+                id=s.id,
+                speaker=s.speaker,
+                start_ms=s.start_ms,
+                end_ms=s.end_ms,
+                locked_track=s.locked_track,
+            )
+            for s in self.subtitles
+        ]
+        error = validate(subs, self.track_count)
+        if error is not None:
+            raise ValueError(error)
+        return self
+
+
+class SceneRevisionRequest(AssignRequest):
+    """场景修订请求：沿用 /assign 的全部字段与校验，另带版本号。
+
+    expected_revision：客户端所依据的当前版本。新场景填 0；
+    已存在场景必须填写当前版本，成功后版本 +1。
+    """
+
+    expected_revision: int = Field(
+        ..., ge=0, description="所依据的当前场景版本；新场景填 0"
+    )
+
+
+class TrackAssignment(BaseModel):
+    id: Union[str, int]
+    track: int
+
+
+class AssignResponse(BaseModel):
+    feasible: bool
+    changes: int = Field(..., description="同一说话人按时间相邻字幕的换轨总数")
+    assignments: List[TrackAssignment]
+
+
+class SubtitleOut(BaseModel):
+    id: Union[str, int]
+    speaker: str
+    start_ms: int
+    end_ms: int
+    locked_track: Optional[int] = None
+
+
+class SceneResponse(BaseModel):
+    """一次成功修订保存后的完整场景快照。"""
+
+    scene_id: str
+    revision: int = Field(..., description="本次提交成功后的新版本号")
+    track_count: int
+    subtitles: List[SubtitleOut]
+    changes: int
+    assignments: List[TrackAssignment]
+    feasible: bool = True
+
+
+# ---------------------------------------------------------------------------
+# 播放会话：请求/响应模型
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateRequest(BaseModel):
+    scene_id: str = Field(..., description="要播放的场景 id")
+
+
+class SessionStateResponse(BaseModel):
+    """会话完整状态：创建与接纳成功后返回。"""
+
+    session_id: str
+    scene_id: str
+    source_revision: int = Field(..., description="会话快照来源的场景版本")
+    cursor_ms: int = Field(..., description="播放游标（毫秒）")
+    track_count: int
+    changes: int
+    subtitles: List[SubtitleOut]
+    assignments: List[TrackAssignment]
+
+
+class ActiveSubtitleOut(BaseModel):
+    id: Union[str, int]
+    speaker: str
+    start_ms: int
+    end_ms: int
+    locked_track: Optional[int] = None
+    track: int
+
+
+class AdvanceRequest(BaseModel):
+    time_ms: int = Field(
+        ..., ge=0, description="推进到的时刻（毫秒，非负整数，只能不减）"
+    )
+
+
+class AdvanceResponse(BaseModel):
+    """推进结果：源版本、游标，以及游标时刻 [start_ms, end_ms) 内的字幕和轨道。"""
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    active: List[ActiveSubtitleOut]
+
+
+# ---------------------------------------------------------------------------
+# SQLite 存储：惰性单例，路径可用环境变量 SCENES_DB_PATH 覆盖
+# ---------------------------------------------------------------------------
+
+_store: Optional[SceneStore] = None
+_store_lock = Lock()
+
+
+def get_store() -> SceneStore:
+    global _store
+    if _store is None:
+        with _store_lock:
+            if _store is None:
+                _store = SceneStore(storage_module.DEFAULT_DB_PATH)
+    return _store
+
+
+def reset_store() -> None:
+    """重置单例（供测试重新指定 SCENES_DB_PATH 后使用）。"""
+    global _store
+    with _store_lock:
+        _store = None
+
+
+# ---------------------------------------------------------------------------
+# 播放会话管理器：单进程内存，不持久化、不跨重启保留
+# ---------------------------------------------------------------------------
+
+_playback: Optional[PlaybackManager] = None
+_playback_lock = Lock()
+
+
+def get_playback() -> PlaybackManager:
+    global _playback
+    if _playback is None:
+        with _playback_lock:
+            if _playback is None:
+                _playback = PlaybackManager()
+    return _playback
+
+
+def reset_playback() -> None:
+    """清空全部播放会话（供测试隔离；会话本就不跨重启保留）。"""
+    global _playback
+    with _playback_lock:
+        _playback = None
+
+
+def _subtitles_from_request(req: AssignRequest) -> List[Subtitle]:
+    return [
+        Subtitle(
+            id=s.id,
+            speaker=s.speaker,
+            start_ms=s.start_ms,
+            end_ms=s.end_ms,
+            locked_track=s.locked_track,
+        )
+        for s in req.subtitles
+    ]
+
+
+def _check_scene_id(scene_id: str) -> None:
+    if scene_id.strip() == "":
+        raise HTTPException(status_code=422, detail="scene_id 不能为空")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/assign", response_model=AssignResponse)
+def assign(req: AssignRequest) -> AssignResponse:
+    subs = _subtitles_from_request(req)
+    tracks, changes = solve(subs, req.track_count)
+    if tracks is None:
+        # 锁定冲突 / 轨道不足：无解，方案为空（HTTP 仍为 200；非法输入才是 422）
+        return AssignResponse(feasible=False, changes=0, assignments=[])
+    return AssignResponse(
+        feasible=True,
+        changes=changes,
+        assignments=[
+            TrackAssignment(id=s.id, track=t) for s, t in zip(subs, tracks)
+        ],
+    )
+
+
+@app.put(
+    "/scenes/{scene_id}",
+    response_model=Union[SceneResponse, AssignResponse],
+)
+def revise_scene(
+    scene_id: str, req: SceneRevisionRequest
+) -> Union[SceneResponse, AssignResponse]:
+    """创建或修订场景。
+
+    - 新场景：expected_revision=0，成功后 revision=1；
+    - 修订：expected_revision 必须等于当前版本，成功后版本 +1；
+    - 合法但无解：沿用 /assign 的无解响应（feasible=false），不保存、不改版本；
+    - 非法输入：422，不改变已有版本；
+    - 版本不符（含同一版本的并发竞争落败方）：409，不改变已有版本。
+    """
+    _check_scene_id(scene_id)
+
+    # 校验由 Pydantic 模型在进入本函数前完成（非法 -> 422）。
+    # 求解沿用 /assign 的同一套校验、最少换轨与并列规则。
+    subs = _subtitles_from_request(req)
+    tracks, changes = solve(subs, req.track_count)
+    if tracks is None:
+        # 合法但无解：与 /assign 完全相同的响应，且不落库
+        return AssignResponse(feasible=False, changes=0, assignments=[])
+
+    subtitles_data = [s.model_dump() for s in req.subtitles]
+    assignments_data = [
+        {"id": s.id, "track": t} for s, t in zip(subs, tracks)
+    ]
+
+    try:
+        new_revision = get_store().commit_revision(
+            scene_id=scene_id,
+            expected_revision=req.expected_revision,
+            track_count=req.track_count,
+            subtitles=subtitles_data,
+            assignments=assignments_data,
+            changes=changes,
+        )
+    except RevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "场景版本冲突：expected_revision 与当前版本不一致",
+                "scene_id": exc.scene_id,
+                "current_revision": exc.current_revision,
+            },
+        )
+
+    return SceneResponse(
+        scene_id=scene_id,
+        revision=new_revision,
+        track_count=req.track_count,
+        subtitles=[s.model_dump() for s in req.subtitles],
+        changes=changes,
+        assignments=[
+            TrackAssignment(id=a["id"], track=a["track"]) for a in assignments_data
+        ],
+    )
+
+
+def _record_to_scene_response(record: SceneRecord) -> SceneResponse:
+    return SceneResponse(
+        scene_id=record.scene_id,
+        revision=record.revision,
+        track_count=record.track_count,
+        subtitles=record.subtitles,
+        changes=record.changes,
+        assignments=record.assignments,
+    )
+
+
+@app.get("/scenes/{scene_id}", response_model=SceneResponse)
+def read_scene(scene_id: str) -> SceneResponse:
+    """读取场景最近一次成功修订的完整快照；不存在返回 404。"""
+    _check_scene_id(scene_id)
+    record = get_store().get_scene(scene_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"场景 {scene_id!r} 不存在")
+    return _record_to_scene_response(record)
+
+
+# ---------------------------------------------------------------------------
+# 播放会话：创建 / 推进 / 接纳
+# ---------------------------------------------------------------------------
+
+
+@app.post("/sessions", response_model=SessionStateResponse)
+def create_session(req: SessionCreateRequest) -> SessionStateResponse:
+    """按 scene_id 创建播放会话。
+
+    复制场景当前的完整快照（字幕、分轨、changes、源版本），游标从
+    0 毫秒开始。会话为单进程内存态，不跨重启保留；场景不存在返回 404。
+    """
+    _check_scene_id(req.scene_id)
+    record = get_store().get_scene(req.scene_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail=f"场景 {req.scene_id!r} 不存在"
+        )
+    return SessionStateResponse(**get_playback().create(record))
+
+
+def _get_session_or_404(session_id: str) -> PlaybackSession:
+    session = get_playback().get(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail=f"播放会话 {session_id!r} 不存在"
+        )
+    return session
+
+
+@app.post("/sessions/{session_id}/advance", response_model=AdvanceResponse)
+def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
+    """推进游标到 time_ms（非负整数，只能不减）。
+
+    返回源版本、游标，以及游标时刻处于 [start_ms, end_ms) 区间的字幕
+    及其轨道。倒退返回 422 且会话不变；会话不存在返回 404。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().advance(session, req.time_ms)
+    except CursorRegression as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "time_ms 只能不减，不得小于当前游标",
+                "cursor_ms": exc.cursor_ms,
+                "time_ms": exc.time_ms,
+            },
+        )
+    return AdvanceResponse(**state)
+
+
+@app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)
+def accept_scene_revision(session_id: str) -> SessionStateResponse:
+    """接纳场景当前快照，让播放中的会话跟上后续修订。
+
+    场景读取、已开始字幕校验、分轨重算与会话替换在同一会话锁内作为
+    完整操作串行生效：并发接纳时，每个请求接纳的都是轮到它生效时的
+    场景快照，迟到的请求不会把会话回写到旧版本。
+
+    - 轨道数不得变；
+    - 会话中 start_ms <= 游标的字幕，其 id、speaker、起止时间、
+      locked_track 必须不变，并固定原分轨；
+    - 其余字幕可改、可删、可新增，但都必须在游标之后开始；
+    - 按新快照顺序与最少换轨、并列规则重算全部分轨。
+
+    冲突或无解返回 409 且会话不变；成功则整体替换会话快照与源版本
+    （场景本身不变），返回会话最新完整状态。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().accept(
+            session, lambda: get_store().get_scene(session.scene_id)
+        )
+    except SceneUnavailable:
+        raise HTTPException(
+            status_code=404, detail=f"场景 {session.scene_id!r} 不存在"
+        )
+    except AcceptConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "scene_id": session.scene_id},
+        )
+    return SessionStateResponse(**state)
